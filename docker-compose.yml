@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  xiaozhi-dev:
+    build: .
+    image: xiaozhi-esp32:latest
+    container_name: xiaozhi-esp32-dev
+    privileged: true  # 需要访问USB设备
+    volumes:
+      # 挂载项目代码
+      - .:/workspace
+      # 缓存ESP-IDF工具和组件，提高构建速度
+      - esp-idf-cache:/opt/esp-idf-tools
+      - esp-components-cache:/workspace/managed_components
+      - esp-build-cache:/workspace/build
+    devices:
+      # USB设备访问（需要根据实际设备调整）
+      - "/dev/ttyUSB0:/dev/ttyUSB0"  # Linux
+      - "/dev/ttyACM0:/dev/ttyACM0"  # Linux
+      # macOS设备会动态变化，建议使用--device参数动态添加
+    environment:
+      - IDF_PATH=/opt/esp-idf
+      - IDF_TOOLS_PATH=/opt/esp-idf-tools
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  # 开发服务器（可选，用于Web界面开发）
+  web-server:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./docs:/usr/share/nginx/html:ro
+    depends_on:
+      - xiaozhi-dev
+
+volumes:
+  esp-idf-cache:
+  esp-components-cache:
+  esp-build-cache:
