@@ -46,6 +46,12 @@ Application::Application() {
     aec_mode_ = kAecOff;
 #endif
 
+#ifdef CONFIG_VAD_TRIGGER_RECORDING
+    vad_trigger_recording_ = true;
+#else
+    vad_trigger_recording_ = false;
+#endif
+
     esp_timer_create_args_t clock_timer_args = {
         .callback = [](void* arg) {
             Application* app = (Application*)arg;
@@ -347,6 +353,12 @@ void Application::Start() {
     };
     callbacks.on_vad_change = [this](bool speaking) {
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
+        // 如果启用了VAD触发录音模式，且检测到语音，自动开始录音
+        if (vad_trigger_recording_ && speaking && device_state_ == kDeviceStateIdle) {
+            Schedule([this]() {
+                OnVadDetected();
+            });
+        }
     };
     audio_service_.SetCallbacks(callbacks);
 
@@ -650,8 +662,15 @@ void Application::SetDeviceState(DeviceState state) {
         case kDeviceStateIdle:
             display->SetStatus(Lang::Strings::STANDBY);
             display->SetEmotion("neutral");
-            audio_service_.EnableVoiceProcessing(false);
-            audio_service_.EnableWakeWordDetection(true);
+            if (vad_trigger_recording_) {
+                // VAD触发录音模式：保持语音处理开启，关闭唤醒词检测
+                audio_service_.EnableVoiceProcessing(true);
+                audio_service_.EnableWakeWordDetection(false);
+            } else {
+                // 普通模式：关闭语音处理，开启唤醒词检测
+                audio_service_.EnableVoiceProcessing(false);
+                audio_service_.EnableWakeWordDetection(true);
+            }
             break;
         case kDeviceStateConnecting:
             display->SetStatus(Lang::Strings::CONNECTING);
@@ -770,4 +789,43 @@ void Application::SetAecMode(AecMode mode) {
 
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
+}
+
+void Application::SetVadTriggerRecording(bool enable) {
+    vad_trigger_recording_ = enable;
+    if (enable) {
+        ESP_LOGI(TAG, "VAD trigger recording enabled");
+        // 启用VAD触发录音时，需要确保VAD始终运行
+        if (device_state_ == kDeviceStateIdle) {
+            audio_service_.EnableVoiceProcessing(true);
+            audio_service_.EnableWakeWordDetection(false);
+        }
+    } else {
+        ESP_LOGI(TAG, "VAD trigger recording disabled");
+        // 禁用VAD触发录音时，恢复唤醒词检测
+        if (device_state_ == kDeviceStateIdle) {
+            audio_service_.EnableVoiceProcessing(false);
+            audio_service_.EnableWakeWordDetection(true);
+        }
+    }
+}
+
+void Application::OnVadDetected() {
+    if (!protocol_) {
+        ESP_LOGE(TAG, "Protocol not initialized");
+        return;
+    }
+
+    if (device_state_ == kDeviceStateIdle) {
+        ESP_LOGI(TAG, "VAD detected, starting recording");
+        
+        if (!protocol_->IsAudioChannelOpened()) {
+            SetDeviceState(kDeviceStateConnecting);
+            if (!protocol_->OpenAudioChannel()) {
+                return;
+            }
+        }
+
+        SetListeningMode(kListeningModeAutoStop);
+    }
 }

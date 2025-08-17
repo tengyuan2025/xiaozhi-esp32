@@ -526,6 +526,13 @@ config RECEIVE_CUSTOM_MESSAGE
     help
         启用接收自定义消息功能，允许设备接收来自服务器的自定义消息（最好通过 MQTT 协议）
 
+config VAD_TRIGGER_RECORDING
+    bool "Enable VAD Triggered Recording"
+    default n
+    depends on USE_AUDIO_PROCESSOR
+    help
+        启用VAD触发录音功能，设备将在检测到语音活动时自动开始录音并发送到服务器，无需唤醒词
+
 choice I2S_TYPE_TAIJIPI_S3
     depends on BOARD_TYPE_ESP32S3_Taiji_Pi
     prompt "taiji-pi-S3 I2S Type"

@@ -60,6 +60,8 @@ public:
     AecMode GetAecMode() const { return aec_mode_; }
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
+    void SetVadTriggerRecording(bool enable);
+    bool IsVadTriggerRecordingEnabled() const { return vad_trigger_recording_; }
 
 private:
     Application();
@@ -75,6 +77,7 @@ private:
     AecMode aec_mode_ = kAecOff;
     std::string last_error_message_;
     AudioService audio_service_;
+    bool vad_trigger_recording_ = false;
 
     bool has_server_time_ = false;
     bool aborted_ = false;
@@ -82,6 +85,7 @@ private:
     TaskHandle_t check_new_version_task_handle_ = nullptr;
 
     void OnWakeWordDetected();
+    void OnVadDetected();
     void CheckNewVersion(Ota& ota);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void OnClockTimer();
