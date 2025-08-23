@@ -4,140 +4,163 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is the Xiaozhi ESP32 AI Chatbot project - a multilingual voice interaction device that supports 70+ ESP32 development boards. It's an MCP-based chatbot that integrates streaming ASR, LLM, and TTS for real-time voice interaction.
+Xiaozhi ESP32 is a multilingual AI chatbot device supporting 70+ ESP32 development boards. It implements real-time voice interaction through streaming ASR, LLM, and TTS with MCP (Model Context Protocol) integration for device control.
 
-## Core Architecture
+## Build Commands
 
-### Main Components
-- **Audio System**: Handles voice input/output with codec support (ES8311, ES8374, ES8388, etc.)
-- **Display System**: Supports various displays (OLED/LCD) with LVGL GUI framework
-- **Communication**: Dual protocol support (WebSocket or MQTT+UDP)
-- **Board Abstraction**: Unified interface supporting 70+ different ESP32 boards
-- **MCP Server**: Device control through Model Context Protocol
-- **Multi-language**: 20+ language support with localized audio assets
-
-### Key Directories
-- `main/` - Core application code
-- `main/boards/` - Board-specific implementations (70+ supported boards)
-- `main/audio/` - Audio codecs and processors
-- `main/display/` - Display drivers and UI
-- `main/protocols/` - Communication protocols (WebSocket/MQTT)
-- `scripts/` - Build and utility scripts
-- `partitions/` - Flash partition configurations
-
-## Common Development Commands
-
-### Building and Flashing
 ```bash
-# Build the project
-idf.py build
+# Standard build workflow
+idf.py build                     # Build firmware
+idf.py flash                     # Flash to device
+idf.py monitor                   # Monitor serial output
+idf.py flash monitor             # Flash and monitor in one step
+idf.py clean                     # Clean build files
 
-# Flash to device
-idf.py flash
+# Board-specific build
+python scripts/release.py [board-name]  # Build for specific board and create release zip
 
-# Monitor serial output
-idf.py monitor
+# Utility commands
+idf.py merge-bin                 # Merge binary files
+idf.py flash_id                  # Check device information
+idf.py erase_flash               # Erase device flash
 
-# Build for specific board (using release script)
-python scripts/release.py [board-name]
-
-# Generate language configuration
-python scripts/gen_lang.py --language zh-CN --output main/assets/lang_config.h
+# Development scripts
+python scripts/gen_lang.py --language zh-CN --output main/assets/lang_config.h  # Generate language config
+python scripts/audio_debug_server.py                                            # Run audio debug server
+./scripts/mp3_to_ogg.sh                                                        # Convert MP3 to OGG for assets
 ```
 
-### Board Configuration
-The project uses a sophisticated board selection system through CMake configurations. Each board has:
-- Board-specific source files in `main/boards/[board-name]/`
-- `config.h` for hardware pin mappings
-- `config.json` for build configurations
+## Architecture Overview
 
-### Audio Asset Management
+### Component Hierarchy
+```
+Application Layer
+├── Application (main/application.cc) - Core application logic, state management
+├── MCP Server (main/mcp_server.cc) - Device control protocol implementation
+└── Board Manager - Hardware abstraction layer
+
+Hardware Abstraction
+├── Board Base Classes
+│   ├── WifiBoard - Wi-Fi enabled boards
+│   ├── Ml307Board - 4G cellular boards  
+│   └── DualNetworkBoard - Wi-Fi + 4G boards
+└── 70+ Board Implementations (main/boards/*/board.cc)
+
+Communication Layer
+├── Protocols
+│   ├── WebSocket (main/protocols/websocket_protocol.cc)
+│   └── MQTT+UDP (main/protocols/mqtt_protocol.cc)
+└── Audio Codec: OPUS compression
+
+Audio Pipeline
+├── Wake Word (ESP-SR) → VAD → Audio Capture (I2S)
+├── Audio Processing (AFE optional)
+└── Codec Support (ES8311, ES8374, ES8388, ES7210, etc.)
+
+Display System  
+├── LVGL 9.2.2 GUI Framework
+├── Display Drivers (LCD/OLED)
+└── Multi-language Font Rendering
+```
+
+### Key Design Patterns
+
+- **Factory Pattern**: Board creation via `DECLARE_BOARD` macro registration
+- **Observer Pattern**: Event system for audio, network, and display events
+- **State Machine**: Application states (INIT, CONNECTING, CONNECTED, RECORDING, etc.)
+- **Plugin Architecture**: MCP tools dynamically registered per board
+
+## Adding New Board Support
+
+1. Create board directory: `main/boards/[board-name]/`
+2. Implement board class in `board.cc`:
+   ```cpp
+   class YourBoard : public WifiBoard {
+       void Initialize() override;
+       void RegisterBoardDependentCommonTools() override;
+   };
+   DECLARE_BOARD(YourBoard);
+   ```
+3. Define hardware pins in `config.h`
+4. Create build configuration `config.json`:
+   ```json
+   {
+     "board_type": "your-board",
+     "chip": "ESP32-S3",
+     "psram": "8MB",
+     "flash": "16MB"
+   }
+   ```
+5. Update `main/CMakeLists.txt` to include board files
+
+## Common Development Tasks
+
+### Testing Audio Pipeline
 ```bash
-# Convert MP3 to OGG for assets
-./scripts/mp3_to_ogg.sh
-
-# Run audio debug server
+# Start audio debug server to test audio transmission
 python scripts/audio_debug_server.py
+
+# Monitor device logs for audio events
+idf.py monitor | grep -E "audio|codec|i2s"
 ```
 
-## Architecture Details
+### Debugging Connection Issues
+- Check WebSocket/MQTT connection in monitor: `idf.py monitor | grep -E "ws|mqtt|connect"`
+- Verify Wi-Fi credentials in NVS storage
+- Test server connectivity with audio debug server
 
-### Board Inheritance Hierarchy
+### Memory Optimization
+- Current version: 1.8.7 (CMakeLists.txt)
+- Monitor heap usage: Look for "Free heap" in serial output
+- Partition layouts in `partitions/v1/` for different flash sizes
+
+## Configuration Systems
+
+### Build Configuration
+- `sdkconfig.defaults` - ESP-IDF SDK configuration
+- `main/Kconfig.projbuild` - Project-specific options (languages, OTA URL)
+- Board-specific `config.json` - Hardware capabilities
+
+### Runtime Configuration
+- NVS storage for Wi-Fi credentials and server settings
+- Language selection from 20+ supported languages
+- Audio parameters (sample rates, codecs) per board
+
+## MCP Tool Development
+
+Tools are registered in `McpServer::AddCommonTools()` and board-specific initialization:
+```cpp
+// Common tools (all boards)
+- volume_get/set - Audio volume control
+- screen_brightness_get/set - Display brightness
+- battery_level_get - Battery status
+- gpio_get/set - GPIO control
+
+// Board-specific tools
+- motor_control - Motor operations
+- led_control - LED patterns
+- sensor_read - Sensor data
 ```
-Board (base class)
-├── WifiBoard - Wi-Fi enabled boards
-├── Ml307Board - 4G cellular boards  
-└── DualNetworkBoard - Boards supporting both Wi-Fi and 4G
-```
 
-### MCP Integration
-The project implements MCP (Model Context Protocol) for device control:
-- `McpServer` class handles tool registration and execution
-- Common tools: volume control, screen brightness, battery status
-- Board-specific tools can be added for custom hardware features
+## Important Files
 
-### Audio Pipeline
-1. **Wake Word Detection** - ESP-SR based offline wake word detection
-2. **Audio Capture** - I2S interface with various codec support
-3. **Audio Processing** - Optional AFE (Audio Front-End) processing
-4. **Communication** - OPUS codec for efficient transmission
-5. **Playback** - Text-to-speech audio playback
+- `main/application.cc` - Core application state machine
+- `main/board.cc` - Base board class and common functionality
+- `main/mcp_server.cc` - MCP protocol implementation
+- `main/display/display.cc` - Display abstraction
+- `main/audio/audio_codec.cc` - Audio codec interface
+- `scripts/release.py` - Build automation for all boards
 
-### Display System
-- LVGL 9.2.2 based GUI framework
-- Support for SPI LCD panels (ST7789, ILI9341, etc.)
-- OLED display support
-- Multi-language font rendering
-- Emoji and icon support
+## Dependencies
 
-### Communication Protocols
-- **WebSocket**: Direct connection for real-time communication
-- **MQTT+UDP**: Hybrid protocol for reliable messaging with low-latency audio
+- ESP-IDF 5.4+ (required)
+- LVGL 9.2.2 (GUI framework)
+- ESP-SR (wake word detection)
+- ESP32 chip variants: ESP32, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-P4
 
-## Development Guidelines
+## Code Style
 
-### Adding New Board Support
-1. Create directory in `main/boards/[board-name]/`
-2. Implement board class inheriting from `WifiBoard`/`Ml307Board`
-3. Define hardware configuration in `config.h`
-4. Add build configuration in `config.json`
-5. Register board using `DECLARE_BOARD` macro
-
-### Audio Codec Integration
-- Implement `AudioCodec` interface
-- Configure I2S parameters in board config
-- Add codec-specific initialization in board class
-- Support both input and output sample rate configuration
-
-### Display Integration
-- Implement `Display` interface (LCD/OLED variants available)
-- Configure SPI/I2C parameters for display communication
-- Set up LVGL with appropriate fonts and color depth
-- Configure backlight control if available
-
-### Localization
-- Audio assets stored in `main/assets/locales/[language-code]/`
-- Language configuration generated from JSON files
-- Support for 20+ languages with proper font rendering
-
-### MCP Tool Development
-- Extend `McpServer::AddCommonTools()` for device-wide tools
-- Add board-specific tools in board initialization
-- Follow MCP specification for tool parameter definitions
-- Implement proper error handling and return values
-
-## Important Configuration Files
-
-- `sdkconfig.defaults` - Default ESP-IDF configuration
-- `CMakeLists.txt` - Main build configuration (current version: 1.8.7)
-- `main/Kconfig.projbuild` - Project-specific configuration options
-- `partitions/v1/` - Flash partition layouts for different flash sizes
-
-## Key Dependencies
-
-- ESP-IDF 5.4+ required
-- LVGL 9.2.2 for GUI
-- ESP-SR for wake word detection
-- Various ESP32 series chips supported (ESP32, ESP32-S3, ESP32-C3, ESP32-C6, ESP32-P4)
-
-This project follows Google C++ coding style and uses MIT license for open source development.
+- Google C++ coding style
+- MIT License
+- No hardcoded secrets or API keys
+- Prefer editing existing files over creating new ones
