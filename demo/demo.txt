@@ -1,0 +1,803 @@
+端到端实时语音大模型API接入文档
+最近更新时间：2025.08.28 19:17:09
+首次发布时间：2025.06.11 14:22:46
+我的收藏
+有用
+无用
+
+1 接口功能
+豆包端到端实时语音大模型API即RealtimeAPI支持低延迟、多模式交互，可用于构建语音到语音的对话工具。该API支持中文和英语两大语种，目前只支持WebSocket协议连接到此API，同时支持客户边发送数据边接收数据的流式交互方式。
+
+
+1.1 产品约束
+客户端上传音频格式要求PCM（脉冲编码调制，未经压缩的的音频格式）、单声道、采样率16000、每个采样点用int16表示、字节序为小端序。
+服务端默认返回的是 OGG 封装的 Opus 音频，兼顾压缩效率与传输性能。
+若客户端在 StartSession事件中增加TTS配置，服务端可返回 PCM 格式的音频流。具体请求参数如下所示：
+单声道、24000Hz 采样率、32bit位深、小端序
+{
+    "tts" : {
+        "audio_config": {
+            "channel": 1,
+            "format": "pcm",
+            "sample_rate": 24000
+        }
+    }
+}
+单声道、24000Hz 采样率、16bit位深、小端序
+{
+    "tts" : {
+        "audio_config": {
+            "channel": 1,
+            "format": "pcm_s16le",
+            "sample_rate": 24000
+        }
+    }
+}
+服务端已新增 4 个音色，客户端需在 StartSession事件中的TTS 配置指定对应的发音人，默认为vv音色。
+zh_female_vv_jupiter_bigtts：对应vv音色，活泼灵动的女声，有很强的分享欲
+zh_female_xiaohe_jupiter_bigtts：对应xiaohe音色，甜美活泼的女声，有明显的台湾口音
+zh_male_yunzhou_jupiter_bigtts：对应yunzhou音色，清爽沉稳的男声
+zh_male_xiaotian_jupiter_bigtts：对应xiaotian音色，清爽磁性的男声
+{
+    "tts": {
+        "speaker": {{STRING}}
+    }
+}
+限流条件分为QPM和TPM，QPM全称query per minute，这里的query对应StartSession事件，即在一个AppID下面每分钟的StartSession事件不能超过配额值。TPM全称tokens per minute，即一分钟所消耗的全部token不能超过对应的配额值。
+
+1.2 最佳实践
+实时对话采用流式输入输出架构，即便用户未发起 query，客户端也需持续发送音频，以维持流式处理链路的正常运行。
+在客户端发送 FinishSession 事件后，系统将不再返回任何事件。但客户端仍可复用与火山语音网关之间的 WebSocket 连接。若需发起新的会话，客户端需重新从 StartSession 事件开始。
+Image
+
+在没有对话需求时候，可以发送FinishSession事件结束会话。如果不想复用websocket连接，可以继续发送FinishConnection事件，释放对应的websocket连接。
+推荐客户端在事件的 optional 字段中携带 event 和 session ID，以降低开发成本，并将事件处理的复杂性交由火山语音服务端负责。
+客户在集成端到端语音合成模型过程中，使用 ChatTTSText 进行音频合成请求的最佳实践方法，其中黄色部分需要客户实现：
+Image
+
+
+2 接口说明
+WebSocket是一种广泛支持的实时数据传输API，也是服务器应用程序中连接到豆包端到端实时语音大模型API的最佳选择。在客户服务器上集成此API时候，可以通过WebSocket直接连接到实时语音大模型API，具体鉴权参数可以在火山控制台获取。
+
+2.1 ws连接详细信息
+通过WebSocket建立连接需要以下连接信息：
+URL
+
+wss://openspeech.bytedance.com/api/v3/realtime/dialogue
+
+Request Headers
+
+Key
+
+说明
+
+是否必须
+
+Value示例
+
+X-Api-App-ID
+
+使用火山引擎控制台获取的APP ID，可参考 控制台使用FAQ-Q1
+
+是
+
+123456789
+
+X-Api-Access-Key
+
+使用火山引擎控制台获取的Access Token，可参考 控制台使用FAQ-Q1
+
+是
+
+your-access-key
+
+X-Api-Resource-Id
+
+表示调用服务的资源信息 ID
+固定值：volc.speech.dialog
+
+是
+
+volc.speech.dialog
+
+X-Api-App-Key
+
+固定值
+
+是
+
+PlgvMymc7f3tQnJ6
+
+X-Api-Connect-Id
+
+用于追踪当前连接情况的标志 ID
+建议用户传递，便于排查连接情况
+
+否
+
+d1dcd999-9a9e-4ed6-b227-8649e946f6c4
+
+在 websocket 握手成功后，会返回如下Response header
+Key
+
+说明
+
+Value示例
+
+X-Tt-Logid
+
+服务端返回的 logid，建议用户获取和打印方便定位问题
+
+20250506234111719BC62BBA7C4C0C635A
+
+
+2.2 WebSocket二进制协议
+豆包端到端实时语音大模型API使用二进制协议传输数据，协议由4字节的header、optioanl、payload size和payload三部分组成，其中：
+
+header用于描述消息类型、序列化方式以及压缩格式等信息
+optional可选字段
+sequence字段
+event字段，用于描述链接过程中状态管理的预定义事件
+connect id size/ connect id字段，用于描述连接类事件的标识
+session id size/ session id 字段，用于描述会话类事件的标识
+error code: 仅用于错误帧，描述错误信息
+payload size代表payload的长度
+payload是具体负载的内容，依据不同的消息类型装载不同的内容
+
+header二进制数据
+Byte
+
+Left-4bit
+
+Right-4bit
+
+说明
+
+0
+
+Protocol Version
+
+目前只有v1，固定0b0001
+
+Header Size
+
+目前只有4字节固定0b0001
+
+1
+
+Message Type
+
+Message type specific flags
+
+详细见下面消息说明
+
+2
+
+Serialization method
+
+0b0000：Raw（无特殊序列化，主要针对二进制音频数据）
+0b0001：JSON（主要针对文本类型消息）
+Compression method
+
+0b0000：无压缩（推荐）
+0b0001：gzip
+3
+
+0x00
+
+Reserved
+
+
+Mesage Type
+Message Type
+
+含义
+
+说明
+
+0b0001
+
+Full-client request
+
+客户端发送文本事件的消息类型
+
+0b1001
+
+Full-server response
+
+服务器返回的文本事件的消息类型
+
+0b0010
+
+Audio-only request
+
+客户端发送音频数据的消息类型
+
+0b1011
+
+Audio-only response
+
+服务器返回音频数据的消息类型
+
+0b1111
+
+Error information
+
+服务器返回的错误事件的消息类型
+
+
+Message type specific flags
+Optional可选字段code、sequence、event取决于Message type specific flags，而connect id和session id取决于事件类型。如果设置对应flag请按照表格顺序进行二进制组装。目前支持的全集如下所示：
+
+字段
+
+长度（Byte）
+
+说明
+
+Message type specific flags
+
+code
+
+4
+
+【可选】错误码code
+
+0b1111：错误帧
+sequence
+
+4
+
+【可选】描述客户端的事件序号
+
+0b0000：没有sequence字段
+0b0001：序号大于 0 的非终端数据包
+0b0010：最后一个无序号的数据包
+0b0011：最后一个序号小于 0 的数据包，一般用-1表示
+event
+
+4
+
+【必须】描述连接过程中状态管理的预定义事件，详细参考实时对话事件中的事件ID
+
+0b0100：携带事件ID
+connect id size
+
+4
+
+【可选】客户事件携带的connect id对应的长度，只有Connect事件才能携带此字段
+
+——
+
+connect id
+
+取决于connect id size
+
+【可选】客户生成的connect id
+
+session id size
+
+4
+
+【必须】客户事件携带的session id对应的长度，只有Session级别的事件携带此字段
+
+session id
+
+取决于session id size
+
+【必须】客户事件携带的session id
+
+
+具体的payload size和payload
+payload可以放音频二进制数据，也可以放类似StartSession事件中的json数据。
+
+字段
+
+长度（Byte）
+
+说明
+
+payload size
+
+4
+
+paylaod长度
+
+payload
+
+长度取决于payload size
+
+payload内容，可以是二进制音频数据，也可以是json字符串
+
+
+错误帧payload
+{
+    "error": {{STRING}}
+}
+
+2.3 实时对话事件
+通过WebSocket连接到豆包端到端实时语音大模型API之后，可以调用S2S模型进行语音到语音的对话。需要发送客户端事件来启动操作，并监听服务器事件以采取对应的操作。
+
+客户端事件
+事件ID
+
+事件定义
+
+事件类型
+
+说明
+
+示例
+
+1
+
+StartConnection
+
+Connect类事件
+
+Websocket 阶段声明创建连接
+
+2
+
+FinishConnection
+
+断开websocket连接，后面需要重新发起websocket连接
+
+100
+
+StartSession
+
+Session类事件
+
+Websocket 阶段声明创建会话，其中：
+
+end_smooth_window_ms字段用于客户调整判断用户停止说话的时间，默认1500ms，取值范围[500ms, 1500ms]
+bot_name字段用于修改基础人设信息，例如人名、来源等，默认为豆包
+system_role字段用于配置背景人设信息，描述角色的来源、设定等，例如“你是大灰狼、用户是小红帽，用户逃跑时你会威胁吃掉他。”
+speaking_style字段用于配置模型对话风格，例如“你说话偏向林黛玉。”、“你口吻拽拽的。”等
+长度限制：bot_name 最长不超过 20 个字符，system_role 与 speaking_style 合计不得超过 4000 个字符
+dialog_id字段用于加载相同dialog id的session对话记录，进而提升模型上下文记忆能力
+location 字段用于客户端传入用户位置信息，以提升联网搜索结果的精准度，关闭内置联网时候无需此字段
+country：默认中国
+country_code：默认CN
+strict_audit字段用于声明安全审核等级，true代表严格审核、false代表普通审核，默认为true
+audit_response字段用于指定用户query命中安全审核之后的自定义回复话术
+enable_volc_websearch字段用于开关内置联网功能，开启内置联网参考火山引擎控制台融合信息搜索API
+volc_websearch_type字段用于指定搜索服务类型
+web_summary代表总结版，不传此参数默认为总结版
+web代表普通版，需要客户指定才能生效
+volc_websearch_api_key字段用于指定客户开通的融合信息搜索API服务访问密钥
+volc_websearch_result_count字段用于指定搜索结果条数，最多50条，不传此参数默认10条【推荐不传此参数】
+volc_websearch_no_result_message字段用于指定没有搜索结果时候的回复话术
+{
+    "asr": {
+        "extra": {
+            "end_smooth_window_ms": {{INT}},
+        }
+    },
+    "dialog": {
+        "bot_name": {{STRING}},
+        "system_role": {{STRING}},
+        "speaking_style": {{STRING}},
+        "dialog_id": {{STRING}},
+        "location": {
+            "longitude": {{Float64}},
+            "latitude": {{Float64}},
+            "city": {{STRING}},
+            "country": {{STRING}},
+            "province": {{STRING}},
+            "district": {{STRING}},
+            "town": {{STRING}},
+            "country_code": {{STRING}},
+            "address": {{STRING}}
+        },
+        "extra" : {
+            "strict_audit": {{BOOLEAN}},
+            "audit_response": {{STRING}},
+            "enable_volc_websearch": {{BOOLEAN}},
+            "volc_websearch_type": {{STRING}},
+            "volc_websearch_api_key": {{STRING}},
+            "volc_websearch_result_count": {{INT}},
+            "volc_websearch_no_result_message": {{STRING}},
+        }
+    }
+}
+102
+
+FinishSession
+
+客户端声明结束会话，后面可以复用websocket连接
+
+200
+
+TaskRequest
+
+客户端上传音频
+
+音频二进制数据
+
+300
+
+SayHello
+
+客户端提交打招呼文本
+
+{
+    "content": {{STRING}}
+}
+500
+
+ChatTTSText
+
+用户query之后，模型会生成闲聊结果。如果客户判断用户query不需要闲聊结果，可以指定文本合成音频
+
+{
+    "start": {{BOOLEAN}},
+    "content": {{STRING}},
+    "end": {{BOOLEAN}}
+}
+501
+
+ChatTextQuery
+
+用户输入文本query，模型输出闲聊结果。如果客户判断用户文本query不需要闲聊结果，可以指定文本合成音频
+
+{
+    "content": {{STRING}}
+}
+备注：
+
+Websocket阶段：在 HTTP 建立连接之后Upgrade
+客户端在发送FinishSession事件之后，websocket连接不会断开，客户端可以继续复用，复用时候需要再发送一次StartSession事件，即重新初始化会话
+Message Type = 0b0001，Message type specific flags = 0b0100，StartConnection事件二进制帧对应的字节数组示例：
+[17 20 16 0 0 0 0 1 0 0 0 2 123 125]
+Message Type = 0b0001，Message type specific flags = 0b0100，SessionID = 75a6126e-427f-49a1-a2c1-621143cb9db3，jsonPayload = {"dialog":{"bot_name":"豆包","dialog_id":"","extra":null}}，StartSession事件二进制帧对应的字节数组示例：
+[17 20 16 0 0 0 0 100 0 0 0 36 55 53 97 54 49 50 54 101 45 52 50 55 102 45 52 57 97 49 45 97 50 99 49 45 54 50 49 49 52 51 99 98 57 100 98 51 0 0 0 60 123 34 100 105 97 108 111 103 34 58 123 34 98 111 116 95 110 97 109 101 34 58 34 232 177 134 229 140 133 34 44 34 100 105 97 108 111 103 95 105 100 34 58 34 34 44 34 101 120 116 114 97 34 58 110 117 108 108 125 125]
+ChatTTSText事件请求示例：
+
+第一包json示例
+{
+    "start": true,
+    "content": "今天是",
+    "end": false
+}
+中间包，用于流式上传待合成音频的文本
+{
+    "start": false,
+    "content": "星期二。",
+    "end": false
+}
+最后一包，若用户在音频播报过程中发起新的 query 导致中断，且合成音频的 end 包尚未发送，此时无需再下发该 end 包，以避免多余流程或状态异常。
+{
+    "start": false,
+    "content": "",
+    "end": true
+}
+
+服务端事件
+事件ID
+
+事件定义
+
+事件类型
+
+说明
+
+示例
+
+50
+
+ConnectionStarted
+
+Connect类
+
+成功建立连接
+
+51
+
+ConnectionFailed
+
+建立连接失败
+
+{
+    "error": {{STRING}}
+}
+52
+
+ConnectionFinished
+
+连接结束
+
+150
+
+SessionStarted
+
+Session类
+
+成功启动会话，返回的dialog id用于接续最近的对话内容，增加模型智能度
+
+{
+    "dialog_id": {{STRING}}
+}
+152
+
+SessionFinished
+
+会话已结束
+
+153
+
+SessionFailed
+
+会话失败
+
+{
+    "error": {{STRING}}
+}
+154
+
+UsageResponse
+
+每一轮交互对应的用量信息
+
+{
+    "usage": {
+        "input_text_tokens": {{INT}},
+        "input_audio_tokens": {{INT}},
+        "cached_text_tokens": {{INT}},
+        "cached_audio_tokens": {{INT}},
+        "output_text_tokens": {{INT}},
+        "output_audio_tokens": {{INT}},
+    }
+}
+350
+
+TTSSentenceStart
+
+合成音频的起始事件，tts_type取值类型有：
+
+audit_content_risky（命中安全审核音频）
+chat_tts_text（客户文本合成音频）
+network（内置联网音频）
+default（闲聊音频）
+{
+    "tts_type": {{STRING}},
+    "text" : {{STRING}},
+}
+351
+
+TTSSentenceEnd
+
+合成音频的分句结束事件
+
+352
+
+TTSResponse
+
+返回模型生成的音频数据
+
+payload装载二进制音频数据
+
+359
+
+TTSEnded
+
+模型一轮音频合成结束事件
+
+450
+
+ASRInfo
+
+模型识别出音频流中的首字返回的事件，用于打断客户端的播报
+
+451
+
+ASRResponse
+
+模型识别出用户说话的文本内容
+
+{
+    "results": [
+      {
+        "text": {{STRING}},
+        "is_interim": {{BOOLEAN}}
+      }
+    ]
+}
+459
+
+ASREnded
+
+模型认为用户说话结束的事件
+
+{}
+550
+
+ChatResponse
+
+模型回复的文本内容
+
+{
+  "content": {{STRING}},
+}
+559
+
+ChatEnded
+
+模型回复文本结束事件
+
+备注：
+
+服务器事件中json paylod可能会多返回一些字段，客户端无需关心
+Message type specific flags = 0b0100，session id =3c791a7d-227a-4446-993b-24f9e302cc98，TTSResponse事件示例：
+[17 180 0 0 0 0 1 96 0 0 0 36 51 99 55 57 49 97 55 100 45 50 50 55 97 45 52 52 52 54 45 57 57 51 98 45 50 52 102 57 101 51 48 50 99 99 57 56 0 0 7 252 79 103 103 83 0 0 64 129 32 0 0 0 0 0 132 149 185 182 172 8 0 0 169 57 249 174 1 71 104 139 98 229 167 232 122 108 0 183 60 54 43 137 197 126 20 248 201 174]
+
+3 快速开始
+
+Python示例
+
+realtime_dialog.zip
+未知大小
+
+
+Go示例
+
+realtime_dialog.zip
+未知大小
+
+您可以通过以下步骤，快速体验与 Realtime 模型API实时对话的功能。
+
+下载realtime_dialog.zip文件到本地，依据操作系统类型对gordonklaus/portaudio依赖进行安装：
+macOS：
+brew install portaudio
+CentOS：
+sudo yum install -y portaudio portaudio-devel
+Debian/Ubuntu：
+sudo apt-get install portaudio19-dev
+安装后在项目下运行：
+go执行命令：go run . -v=0
+python执行命令：python main.py
+
+4 交互示例
+RealtimeAPI的交互流程目前只支持server_vad模式，该模式的交互流程如下：
+
+客户端发送StartSession事件初始化会话
+客户端可以随时通过TaskRequest事件将音频发送到服务端
+服务端在检测到用户说话的时候，会返回ASRInfo和ASRResponse事件，同时在检测到用户说话结束之后返回ASREnded事件
+服务端合成的音频通过TTSResponse事件将音频返回给客户端
+Image
+
+
+4.1 合成音频
+当客户判定不使用模型生成闲聊内容时，系统允许客户多次上传文本执行音频合成，以满足多样化需求。整体交互示例如下所示：
+Image
+
+
+5 错误码
+类型
+
+错误码
+
+错误定义
+
+说明
+
+客户端
+
+45000002
+
+Empty audio
+
+客户上传空的音频包，即TaskRequest事件中的音频长度为0
+
+45000003
+
+Abnormal silence audio
+
+10分钟静音释放链接
+
+服务端
+
+55000001
+
+Server processing error
+
+服务端超过10秒没有收到query音频（客户端想要保持链接需要一直发送静音音频）
+
+下游服务超过35秒没有收到tts回复
+
+服务端处理错误（通用型错误，需要借助logid进行深入排查）
+
+55000030
+
+Service unavailable
+
+下游模块建立连接失败
+
+55002070
+
+AudioFlow error
+
+下游返回错误信息，统一对外的错误码
+
+
+6.文档修订记录
+日期
+
+update
+
+25.08.27
+
+支持文本query和端到端模型进行交互，需要注意的是，再使用文本query进行交互时候，静音音频还是要发送的；
+
+25.08.20
+
+demo示例放开用户说话停止时间参数；system_role和speaking_style总长放开到4000；
+
+25.08.13
+
+Go demo修复并发写websocket的问题；支持内置联网开关，默认关闭；支持用户自己开通火山融合搜索服务；支持返回用量信息到客户端；支持system_role和speaking_style传入带转义字符的文本；
+
+25.08.06
+
+demo示例新增代码：支持传入录音文件；支持多音色；支持两种pcm位深；
+
+25.08.01
+
+文档更新功能：支持两种pcm位深；支持多发音人；支持内置联网；
+
+25.07.14
+
+支持客户自定义用户query命中安全审核时候的回复话术，新增audit_response字段
+
+25.07.09
+
+go示例修复一个tts音色配置bug
+
+25.07.03
+
+python示例开放模型人设区域，提升端到端模型自定义能力；增加SayHello、ChatTTSText事件发送示例；
+
+25.07.01
+
+客户端在发送ChatTTSText事件时候一定要在收到ASREnded事件之后；增加一些报错处理，例如appkey错误、sp配置长度超过限制；
+
+25.06.25
+
+Go示例开放模型人设区域，提升端到端模型自定义能力；增加SayHello、ChatTTSText事件发送示例；
+
+25.06.10
+
+更新realtime_dialog示例，用户query打断本地播放音频
+
+25.06.05
+
+更新realtime_dialog 示例，ctrl+c之后发送FinishSession、FinishConnection事件之后，再调用close断开websocket连接
+
+25.06.05
+
+补充客户接入ChatTTSText的最佳实践
+
+25.06.04
+
+删除服务端返回的UsageResponse事件，客户可以在火山控制台查看用量
+
+25.06.04
+
+更新realtime_dialog Go示例demo，新增sayHello、chatTTSTesxt数据构造示例
+
+25.06.03
+
+新增realtime_dialog Python示例demo
+
+25.05.30
+
+更新realtime_dialog示例，新增pcm保存到文件代码示例
+
+25.05.30
+
+更新Message type specific flags说明，注明必须传的字段
+
+25.05.28
+
+更新realtime_dialog Go示例demo，修复录音上传慢问题

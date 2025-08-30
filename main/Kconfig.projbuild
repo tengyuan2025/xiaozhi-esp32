@@ -533,6 +533,25 @@ config VAD_TRIGGER_RECORDING
     help
         启用VAD触发录音功能，设备将在检测到语音活动时自动开始录音并发送到服务器，无需唤醒词
 
+choice PROTOCOL_TYPE
+    prompt "Communication Protocol"
+    default USE_WEBSOCKET_PROTOCOL
+    help
+        选择与服务器通信的协议类型
+    config USE_WEBSOCKET_PROTOCOL
+        bool "WebSocket Protocol (Original)"
+        help
+            使用原始的WebSocket协议与小智服务器通信
+    config USE_DOUBAO_PROTOCOL
+        bool "Doubao End-to-End Voice Protocol"
+        help
+            使用豆包端到端语音协议，实现低延迟语音对话
+    config USE_MQTT_PROTOCOL
+        bool "MQTT + UDP Protocol"
+        help
+            使用MQTT协议进行控制，UDP协议传输音频数据
+endchoice
+
 choice I2S_TYPE_TAIJIPI_S3
     depends on BOARD_TYPE_ESP32S3_Taiji_Pi
     prompt "taiji-pi-S3 I2S Type"

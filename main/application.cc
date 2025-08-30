@@ -5,6 +5,9 @@
 #include "audio_codec.h"
 #include "mqtt_protocol.h"
 #include "websocket_protocol.h"
+#ifdef CONFIG_USE_DOUBAO_PROTOCOL
+#include "doubao_protocol.h"
+#endif
 #include "font_awesome_symbols.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
@@ -381,14 +384,24 @@ void Application::Start() {
     // Add MCP common tools before initializing the protocol
     McpServer::GetInstance().AddCommonTools();
 
+#ifdef CONFIG_USE_DOUBAO_PROTOCOL
+    // Use Doubao protocol when configured
+    ESP_LOGI(TAG, "Using Doubao end-to-end voice protocol");
+    protocol_ = std::make_unique<DoubaoProtocol>();
+#elif defined(CONFIG_USE_MQTT_PROTOCOL)
+    ESP_LOGI(TAG, "Using MQTT protocol");
+    protocol_ = std::make_unique<MqttProtocol>();
+#else
+    // Default to WebSocket protocol, with fallback based on OTA config
     if (ota.HasMqttConfig()) {
         protocol_ = std::make_unique<MqttProtocol>();
     } else if (ota.HasWebsocketConfig()) {
         protocol_ = std::make_unique<WebsocketProtocol>();
     } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using MQTT");
-        protocol_ = std::make_unique<MqttProtocol>();
+        ESP_LOGW(TAG, "No protocol specified in the OTA config, using WebSocket");
+        protocol_ = std::make_unique<WebsocketProtocol>();
     }
+#endif
 
     protocol_->OnNetworkError([this](const std::string& message) {
         last_error_message_ = message;
