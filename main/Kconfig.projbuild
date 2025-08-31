@@ -535,9 +535,13 @@ config VAD_TRIGGER_RECORDING
 
 choice PROTOCOL_TYPE
     prompt "Communication Protocol"
-    default USE_WEBSOCKET_PROTOCOL
+    default USE_HTTP_PROTOCOL
     help
         选择与服务器通信的协议类型
+    config USE_HTTP_PROTOCOL
+        bool "HTTP API Protocol"
+        help
+            使用HTTP POST直接调用语音处理API
     config USE_WEBSOCKET_PROTOCOL
         bool "WebSocket Protocol (Original)"
         help

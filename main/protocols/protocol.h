@@ -66,6 +66,7 @@ public:
     virtual void CloseAudioChannel() = 0;
     virtual bool IsAudioChannelOpened() const = 0;
     virtual bool SendAudio(std::unique_ptr<AudioStreamPacket> packet) = 0;
+    virtual bool SendPcmAudio(const std::vector<int16_t>& pcm_data) { return false; } // 默认实现返回false
     virtual void SendWakeWordDetected(const std::string& wake_word);
     virtual void SendStartListening(ListeningMode mode);
     virtual void SendStopListening();

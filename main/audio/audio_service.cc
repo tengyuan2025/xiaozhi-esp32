@@ -1,6 +1,7 @@
 #include "audio_service.h"
 #include <esp_log.h>
 #include <cstring>
+#include <inttypes.h>
 
 #if CONFIG_USE_AUDIO_PROCESSOR
 #include "processors/afe_audio_processor.h"
@@ -61,7 +62,13 @@ void AudioService::Initialize(AudioCodec* codec) {
 #endif
 
     audio_processor_->OnOutput([this](std::vector<int16_t>&& data) {
-        PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        // 如果有PCM数据回调，直接发送PCM数据（用于HTTP协议）
+        if (callbacks_.on_pcm_data_available) {
+            callbacks_.on_pcm_data_available(data);
+        } else {
+            // 否则进行OPUS编码（用于WebSocket/MQTT协议）
+            PushTaskToEncodeQueue(kAudioTaskTypeEncodeToSendQueue, std::move(data));
+        }
     });
 
     audio_processor_->OnVadStateChange([this](bool speaking) {
@@ -153,6 +160,7 @@ void AudioService::Stop() {
 
 bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, int samples) {
     if (!codec_->input_enabled()) {
+        ESP_LOGI(TAG, "🎤 Enabling audio input (sample rate: %d, samples: %d)", sample_rate, samples);
         esp_timer_stop(audio_power_timer_);
         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
         codec_->EnableInput(true);
@@ -187,7 +195,24 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
     } else {
         data.resize(samples * codec_->input_channels());
         if (!codec_->InputData(data)) {
+            ESP_LOGE(TAG, "❌ Failed to read audio from codec");
             return false;
+        }
+        
+        // Debug microphone input levels
+        static int debug_counter = 0;
+        if (debug_counter++ % 50 == 0) { // Log every 50 reads to avoid spam
+            int32_t max_level = 0;
+            for (size_t i = 0; i < data.size(); i++) {
+                int32_t abs_val = abs(data[i]);
+                if (abs_val > max_level) {
+                    max_level = abs_val;
+                }
+            }
+            ESP_LOGI(TAG, "🎤 Mic: %zu samples, max: %" PRId32 " (%.1f%%)", 
+                     data.size(), max_level, (float)max_level * 100.0f / 32767.0f);
+            ESP_LOGI(TAG, "🎚️ Audio: %d->%d Hz, %d channels", 
+                     codec_->input_sample_rate(), sample_rate, codec_->input_channels());
         }
     }
 
@@ -260,11 +285,26 @@ void AudioService::AudioInputTask() {
         if (bits & AS_EVENT_AUDIO_PROCESSOR_RUNNING) {
             std::vector<int16_t> data;
             int samples = audio_processor_->GetFeedSize();
+            ESP_LOGD(TAG, "🎙️ Audio processor feed size: %d samples", samples);
             if (samples > 0) {
                 if (ReadAudioData(data, 16000, samples)) {
+                    // Calculate audio level for debugging
+                    int32_t max_level = 0;
+                    for (size_t i = 0; i < data.size(); i++) {
+                        int32_t abs_val = abs(data[i]);
+                        if (abs_val > max_level) {
+                            max_level = abs_val;
+                        }
+                    }
+                    ESP_LOGD(TAG, "🎵 Read audio: %zu samples, max level: %" PRId32 " (%.1f%%)", 
+                             data.size(), max_level, (float)max_level * 100.0f / 32767.0f);
                     audio_processor_->Feed(std::move(data));
                     continue;
+                } else {
+                    ESP_LOGW(TAG, "⚠️ Failed to read audio data from codec");
                 }
+            } else {
+                ESP_LOGW(TAG, "⚠️ Audio processor feed size is 0");
             }
         }
 

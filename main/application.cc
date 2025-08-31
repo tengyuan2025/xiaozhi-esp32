@@ -3,10 +3,14 @@
 #include "display.h"
 #include "system_info.h"
 #include "audio_codec.h"
+#ifdef CONFIG_USE_MQTT_PROTOCOL
 #include "mqtt_protocol.h"
+#endif
+#ifdef CONFIG_USE_WEBSOCKET_PROTOCOL
 #include "websocket_protocol.h"
-#ifdef CONFIG_USE_DOUBAO_PROTOCOL
-#include "doubao_protocol.h"
+#endif
+#ifdef CONFIG_USE_HTTP_PROTOCOL
+#include "http_protocol.h"
 #endif
 #include "font_awesome_symbols.h"
 #include "assets/lang_config.h"
@@ -148,11 +152,13 @@ void Application::ToggleChatState() {
 
     if (device_state_ == kDeviceStateIdle) {
         Schedule([this]() {
-            if (!protocol_->IsAudioChannelOpened()) {
+            if (protocol_ && !protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
                     return;
                 }
+            } else if (!protocol_) {
+                ESP_LOGI(TAG, "Running in offline mode, skipping protocol connection");
             }
 
             SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
@@ -163,7 +169,9 @@ void Application::ToggleChatState() {
         });
     } else if (device_state_ == kDeviceStateListening) {
         Schedule([this]() {
-            protocol_->CloseAudioChannel();
+            if (protocol_ != nullptr) {
+                protocol_->CloseAudioChannel();
+            }
         });
     }
 }
@@ -185,11 +193,13 @@ void Application::StartListening() {
     
     if (device_state_ == kDeviceStateIdle) {
         Schedule([this]() {
-            if (!protocol_->IsAudioChannelOpened()) {
+            if (protocol_ != nullptr && !protocol_->IsAudioChannelOpened()) {
                 SetDeviceState(kDeviceStateConnecting);
                 if (!protocol_->OpenAudioChannel()) {
                     return;
                 }
+            } else if (protocol_ == nullptr) {
+                ESP_LOGI(TAG, "Running in offline mode, skipping protocol connection");
             }
 
             SetListeningMode(kListeningModeManualStop);
@@ -221,7 +231,9 @@ void Application::StopListening() {
 
     Schedule([this]() {
         if (device_state_ == kDeviceStateListening) {
-            protocol_->SendStopListening();
+            if (protocol_ != nullptr) {
+                protocol_->SendStopListening();
+            }
             SetDeviceState(kDeviceStateIdle);
         }
     });
@@ -247,14 +259,36 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
+        ESP_LOGI(TAG, "🎤 VAD State Changed: %s (recording=%s, state=%s)", 
+                 speaking ? "VOICE_DETECTED" : "VOICE_STOPPED",
+                 vad_trigger_recording_ ? "enabled" : "disabled",
+                 STATE_STRINGS[device_state_]);
+                 
         xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
         // 如果启用了VAD触发录音模式，且检测到语音，自动开始录音
         if (vad_trigger_recording_ && speaking && device_state_ == kDeviceStateIdle) {
+            ESP_LOGI(TAG, "🎙️ VAD triggered recording - starting audio capture and processing");
             Schedule([this]() {
                 OnVadDetected();
             });
         }
     };
+    
+    // 对于HTTP协议，设置PCM数据回调
+#ifdef CONFIG_USE_HTTP_PROTOCOL
+    callbacks.on_pcm_data_available = [this](const std::vector<int16_t>& pcm_data) {
+        ESP_LOGI(TAG, "📡 PCM Data Available: %zu samples (%.2f ms, %.2f KB)", 
+                 pcm_data.size(), 
+                 (float)pcm_data.size() / 16.0f,  // 16kHz采样率转换为毫秒
+                 (float)pcm_data.size() * sizeof(int16_t) / 1024.0f);  // 数据大小KB
+                 
+        if (protocol_ != nullptr) {
+            protocol_->SendPcmAudio(pcm_data);
+        } else {
+            ESP_LOGW(TAG, "⚠️ PCM data received but no protocol available");
+        }
+    };
+#endif
     audio_service_.SetCallbacks(callbacks);
 
     /* Start the clock timer to update the status bar */
@@ -273,44 +307,46 @@ void Application::Start() {
     // Add MCP common tools before initializing the protocol
     McpServer::GetInstance().AddCommonTools();
 
-#ifdef CONFIG_USE_DOUBAO_PROTOCOL
-    // Use Doubao protocol when configured
-    ESP_LOGI(TAG, "Using Doubao end-to-end voice protocol");
-    protocol_ = std::make_unique<DoubaoProtocol>();
+#ifdef CONFIG_USE_HTTP_PROTOCOL
+    ESP_LOGI(TAG, "Using HTTP protocol");
+    protocol_ = std::make_unique<HttpProtocol>();
 #elif defined(CONFIG_USE_MQTT_PROTOCOL)
     ESP_LOGI(TAG, "Using MQTT protocol");
     protocol_ = std::make_unique<MqttProtocol>();
-#else
-    // Default to WebSocket protocol
+#elif defined(CONFIG_USE_WEBSOCKET_PROTOCOL)
     ESP_LOGI(TAG, "Using WebSocket protocol");
     protocol_ = std::make_unique<WebsocketProtocol>();
+#else
+    ESP_LOGI(TAG, "No protocol configured, device will run in WiFi-only mode");
+    protocol_ = nullptr;
 #endif
 
-    protocol_->OnNetworkError([this](const std::string& message) {
-        last_error_message_ = message;
-        xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
-    });
-    protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
-        if (device_state_ == kDeviceStateSpeaking) {
-            audio_service_.PushPacketToDecodeQueue(std::move(packet));
-        }
-    });
-    protocol_->OnAudioChannelOpened([this, codec, &board]() {
-        board.SetPowerSaveMode(false);
-        if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
-            ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
-                protocol_->server_sample_rate(), codec->output_sample_rate());
-        }
-    });
-    protocol_->OnAudioChannelClosed([this, &board]() {
-        board.SetPowerSaveMode(true);
-        Schedule([this]() {
-            auto display = Board::GetInstance().GetDisplay();
-            display->SetChatMessage("system", "");
-            SetDeviceState(kDeviceStateIdle);
+    if (protocol_ != nullptr) {
+        protocol_->OnNetworkError([this](const std::string& message) {
+            last_error_message_ = message;
+            xEventGroupSetBits(event_group_, MAIN_EVENT_ERROR);
         });
-    });
-    protocol_->OnIncomingJson([this, display](const cJSON* root) {
+        protocol_->OnIncomingAudio([this](std::unique_ptr<AudioStreamPacket> packet) {
+            if (device_state_ == kDeviceStateSpeaking) {
+                audio_service_.PushPacketToDecodeQueue(std::move(packet));
+            }
+        });
+        protocol_->OnAudioChannelOpened([this, codec, &board]() {
+            board.SetPowerSaveMode(false);
+            if (protocol_->server_sample_rate() != codec->output_sample_rate()) {
+                ESP_LOGW(TAG, "Server sample rate %d does not match device output sample rate %d, resampling may cause distortion",
+                    protocol_->server_sample_rate(), codec->output_sample_rate());
+            }
+        });
+        protocol_->OnAudioChannelClosed([this, &board]() {
+            board.SetPowerSaveMode(true);
+            Schedule([this]() {
+                auto display = Board::GetInstance().GetDisplay();
+                display->SetChatMessage("system", "");
+                SetDeviceState(kDeviceStateIdle);
+            });
+        });
+        protocol_->OnIncomingJson([this, display](const cJSON* root) {
         // Parse JSON data
         auto type = cJSON_GetObjectItem(root, "type");
         if (strcmp(type->valuestring, "tts") == 0) {
@@ -398,10 +434,30 @@ void Application::Start() {
         } else {
             ESP_LOGW(TAG, "Unknown message type: %s", type->valuestring);
         }
-    });
-    bool protocol_started = protocol_->Start();
+        });
+    }
+    bool protocol_started = false;
+    if (protocol_ != nullptr) {
+        protocol_started = protocol_->Start();
+    } else {
+        ESP_LOGI(TAG, "Running in offline mode, no network protocol will be used");
+        protocol_started = true; // 离线模式视为启动成功
+    }
 
     SetDeviceState(kDeviceStateIdle);
+
+    // Initialize audio processing mode based on protocol availability
+    if (vad_trigger_recording_ && protocol_ != nullptr) {
+        ESP_LOGI(TAG, "Initializing VAD trigger recording mode with protocol");
+        audio_service_.EnableVoiceProcessing(true);
+        audio_service_.EnableWakeWordDetection(false);
+    } else if (vad_trigger_recording_) {
+        ESP_LOGI(TAG, "VAD trigger recording enabled but no protocol - using wake word mode");
+        audio_service_.EnableWakeWordDetection(true);
+    } else {
+        ESP_LOGI(TAG, "Using wake word detection mode");
+        audio_service_.EnableWakeWordDetection(true);
+    }
 
     has_server_time_ = false;
     if (protocol_started) {
@@ -457,9 +513,16 @@ void Application::MainEventLoop() {
         }
 
         if (bits & MAIN_EVENT_SEND_AUDIO) {
-            while (auto packet = audio_service_.PopPacketFromSendQueue()) {
-                if (!protocol_->SendAudio(std::move(packet))) {
-                    break;
+            if (protocol_ != nullptr) {
+                while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                    if (!protocol_->SendAudio(std::move(packet))) {
+                        break;
+                    }
+                }
+            } else {
+                // In offline mode, consume audio packets to prevent buffer overflow
+                while (auto packet = audio_service_.PopPacketFromSendQueue()) {
+                    // Discard the packet silently
                 }
             }
         }
@@ -494,23 +557,27 @@ void Application::OnWakeWordDetected() {
     if (device_state_ == kDeviceStateIdle) {
         audio_service_.EncodeWakeWord();
 
-        if (!protocol_->IsAudioChannelOpened()) {
+        if (protocol_ != nullptr && !protocol_->IsAudioChannelOpened()) {
             SetDeviceState(kDeviceStateConnecting);
             if (!protocol_->OpenAudioChannel()) {
                 audio_service_.EnableWakeWordDetection(true);
                 return;
             }
+        } else if (protocol_ == nullptr) {
+            ESP_LOGI(TAG, "Running in offline mode, skipping protocol connection");
         }
 
         auto wake_word = audio_service_.GetLastWakeWord();
         ESP_LOGI(TAG, "Wake word detected: %s", wake_word.c_str());
 #if CONFIG_USE_AFE_WAKE_WORD || CONFIG_USE_CUSTOM_WAKE_WORD
         // Encode and send the wake word data to the server
-        while (auto packet = audio_service_.PopWakeWordPacket()) {
-            protocol_->SendAudio(std::move(packet));
+        if (protocol_ != nullptr) {
+            while (auto packet = audio_service_.PopWakeWordPacket()) {
+                protocol_->SendAudio(std::move(packet));
+            }
+            // Set the chat state to wake word detected
+            protocol_->SendWakeWordDetected(wake_word);
         }
-        // Set the chat state to wake word detected
-        protocol_->SendWakeWordDetected(wake_word);
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
 #else
         SetListeningMode(aec_mode_ == kAecOff ? kListeningModeAutoStop : kListeningModeRealtime);
@@ -527,7 +594,9 @@ void Application::OnWakeWordDetected() {
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
     aborted_ = true;
-    protocol_->SendAbortSpeaking(reason);
+    if (protocol_ != nullptr) {
+        protocol_->SendAbortSpeaking(reason);
+    }
 }
 
 void Application::SetListeningMode(ListeningMode mode) {
@@ -579,7 +648,9 @@ void Application::SetDeviceState(DeviceState state) {
             // Make sure the audio processor is running
             if (!audio_service_.IsAudioProcessorRunning()) {
                 // Send the start listening command
-                protocol_->SendStartListening(listening_mode_);
+                if (protocol_ != nullptr) {
+                    protocol_->SendStartListening(listening_mode_);
+                }
                 audio_service_.EnableVoiceProcessing(true);
                 audio_service_.EnableWakeWordDetection(false);
             }
@@ -613,8 +684,8 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     if (device_state_ == kDeviceStateIdle) {
         ToggleChatState();
         Schedule([this, wake_word]() {
-            if (protocol_) {
-                protocol_->SendWakeWordDetected(wake_word); 
+            if (protocol_ != nullptr) {
+                protocol_->SendWakeWordDetected(wake_word);
             }
         }); 
     } else if (device_state_ == kDeviceStateSpeaking) {
@@ -624,7 +695,9 @@ void Application::WakeWordInvoke(const std::string& wake_word) {
     } else if (device_state_ == kDeviceStateListening) {   
         Schedule([this]() {
             if (protocol_) {
+                if (protocol_ != nullptr) {
                 protocol_->CloseAudioChannel();
+            }
             }
         });
     }
@@ -649,7 +722,7 @@ bool Application::CanEnterSleepMode() {
 
 void Application::SendMcpMessage(const std::string& payload) {
     Schedule([this, payload]() {
-        if (protocol_) {
+        if (protocol_ != nullptr) {
             protocol_->SendMcpMessage(payload);
         }
     });
@@ -677,7 +750,9 @@ void Application::SetAecMode(AecMode mode) {
 
         // If the AEC mode is changed, close the audio channel
         if (protocol_ && protocol_->IsAudioChannelOpened()) {
-            protocol_->CloseAudioChannel();
+            if (protocol_ != nullptr) {
+                protocol_->CloseAudioChannel();
+            }
         }
     });
 }
@@ -706,21 +781,30 @@ void Application::SetVadTriggerRecording(bool enable) {
 }
 
 void Application::OnVadDetected() {
-    if (!protocol_) {
-        ESP_LOGE(TAG, "Protocol not initialized");
-        return;
-    }
+    ESP_LOGI(TAG, "🎯 OnVadDetected() called - device_state: %s", STATE_STRINGS[device_state_]);
 
     if (device_state_ == kDeviceStateIdle) {
-        ESP_LOGI(TAG, "VAD detected, starting recording");
+        ESP_LOGI(TAG, "🚀 VAD detected, starting recording session...");
         
-        if (!protocol_->IsAudioChannelOpened()) {
-            SetDeviceState(kDeviceStateConnecting);
-            if (!protocol_->OpenAudioChannel()) {
-                return;
+        if (protocol_ != nullptr) {
+            if (!protocol_->IsAudioChannelOpened()) {
+                ESP_LOGI(TAG, "🔗 Opening audio channel for HTTP transmission...");
+                SetDeviceState(kDeviceStateConnecting);
+                if (!protocol_->OpenAudioChannel()) {
+                    ESP_LOGE(TAG, "❌ Failed to open audio channel, will retry on next VAD trigger");
+                    return;
+                }
+                ESP_LOGI(TAG, "✅ Audio channel opened successfully");
+            } else {
+                ESP_LOGI(TAG, "✅ Audio channel already open, proceeding with recording");
             }
+        } else {
+            ESP_LOGW(TAG, "⚠️ No protocol available - running in offline mode");
         }
 
+        ESP_LOGI(TAG, "🎵 Switching to listening mode (auto-stop)");
         SetListeningMode(kListeningModeAutoStop);
+    } else {
+        ESP_LOGW(TAG, "⚠️ VAD detected but device not in idle state (current: %s)", STATE_STRINGS[device_state_]);
     }
 }

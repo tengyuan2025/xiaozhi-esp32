@@ -1,5 +1,6 @@
 #include "afe_audio_processor.h"
 #include <esp_log.h>
+#include <inttypes.h>
 
 #define PROCESSOR_RUNNING 0x01
 
@@ -31,10 +32,19 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
     char* ns_model_name = esp_srmodel_filter(models, ESP_NSNET_PREFIX, NULL);
     char* vad_model_name = esp_srmodel_filter(models, ESP_VADN_PREFIX, NULL);
     
+    ESP_LOGI(TAG, "🎛️ AFE Configuration:");
+    ESP_LOGI(TAG, "  📡 Input format: %s", input_format.c_str());
+    ESP_LOGI(TAG, "  🎤 Input channels: %d (reference: %d)", codec_->input_channels(), ref_num);
+    ESP_LOGI(TAG, "  📊 Frame samples: %d", frame_samples_);
+    
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
-    afe_config->vad_mode = VAD_MODE_0;
-    afe_config->vad_min_noise_ms = 100;
+    // Try more sensitive VAD mode for debugging
+    afe_config->vad_mode = VAD_MODE_0;  // 0=normal, 1=loose, 2=strict
+    afe_config->vad_min_noise_ms = 50;  // Reduced from 100ms to make more sensitive
+    
+    ESP_LOGI(TAG, "  🔊 VAD mode: %d", afe_config->vad_mode);
+    ESP_LOGI(TAG, "  🔇 VAD min noise ms: %d", afe_config->vad_min_noise_ms);
     if (vad_model_name != nullptr) {
         afe_config->vad_model_name = vad_model_name;
     }
@@ -55,13 +65,21 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
 #ifdef CONFIG_USE_DEVICE_AEC
     afe_config->aec_init = true;
     afe_config->vad_init = false;
+    ESP_LOGI(TAG, "  ✅ Device AEC enabled, VAD disabled");
 #else
     afe_config->aec_init = false;
     afe_config->vad_init = true;
+    ESP_LOGI(TAG, "  ✅ VAD enabled, Device AEC disabled");
 #endif
+
+    ESP_LOGI(TAG, "  🔧 VAD model: %s", vad_model_name ? vad_model_name : "NULL");
+    ESP_LOGI(TAG, "  🔧 NS model: %s", ns_model_name ? ns_model_name : "NULL");
 
     afe_iface_ = esp_afe_handle_from_config(afe_config);
     afe_data_ = afe_iface_->create_from_config(afe_config);
+    
+    ESP_LOGI(TAG, "🚀 AFE initialized successfully, VAD init: %s", 
+             afe_config->vad_init ? "ENABLED" : "DISABLED");
     
     xTaskCreate([](void* arg) {
         auto this_ = (AfeAudioProcessor*)arg;
@@ -86,8 +104,22 @@ size_t AfeAudioProcessor::GetFeedSize() {
 
 void AfeAudioProcessor::Feed(std::vector<int16_t>&& data) {
     if (afe_data_ == nullptr) {
+        ESP_LOGW(TAG, "⚠️ AFE not initialized, dropping %zu samples", data.size());
         return;
     }
+    
+    // Calculate audio level for debugging
+    int32_t max_level = 0;
+    for (size_t i = 0; i < data.size(); i++) {
+        int32_t abs_val = abs(data[i]);
+        if (abs_val > max_level) {
+            max_level = abs_val;
+        }
+    }
+    
+    ESP_LOGD(TAG, "🎵 Feeding audio: %zu samples, max level: %" PRId32 "/32767 (%.1f%%)", 
+             data.size(), max_level, (float)max_level * 100.0f / 32767.0f);
+    
     afe_iface_->feed(afe_data_, data.data());
 }
 
@@ -134,14 +166,22 @@ void AfeAudioProcessor::AudioProcessorTask() {
             continue;
         }
 
-        // VAD state change
+        // VAD state change with detailed logging
         if (vad_state_change_callback_) {
+            ESP_LOGI(TAG, "🎙️ Raw VAD state: %d, current is_speaking_: %s", 
+                     res->vad_state, is_speaking_ ? "true" : "false");
+            
             if (res->vad_state == VAD_SPEECH && !is_speaking_) {
                 is_speaking_ = true;
+                ESP_LOGI(TAG, "🔊 VAD SPEECH DETECTED! Triggering callback (silence->speech)");
                 vad_state_change_callback_(true);
             } else if (res->vad_state == VAD_SILENCE && is_speaking_) {
                 is_speaking_ = false;
+                ESP_LOGI(TAG, "🔇 VAD SILENCE DETECTED! Triggering callback (speech->silence)");
                 vad_state_change_callback_(false);
+            } else {
+                ESP_LOGD(TAG, "🎯 VAD state unchanged: %s", 
+                         res->vad_state == VAD_SPEECH ? "SPEECH" : "SILENCE");
             }
         }
 
