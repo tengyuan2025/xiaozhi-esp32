@@ -1,10 +1,12 @@
 #include "doubao_protocol.h"
+#include "board.h"
 #include <cJSON.h>
 #include <esp_log.h>
 #include <esp_random.h>
 #include <arpa/inet.h>
-#include <zlib.h>
+// #include <zlib.h>  // Temporarily disabled - no zlib in ESP-IDF
 #include <esp_system.h>
+#include <cinttypes>
 
 #define TAG "DoubaoProtocol"
 
@@ -21,7 +23,7 @@ DoubaoProtocol::DoubaoProtocol()
     uint32_t random2 = esp_random();
     uint32_t random3 = esp_random();
     uint32_t random4 = esp_random();
-    snprintf(uuid_str, sizeof(uuid_str), "%08x-%04x-%04x-%04x-%08x%04x",
+    snprintf(uuid_str, sizeof(uuid_str), "%08" PRIx32 "-%04" PRIx32 "-%04" PRIx32 "-%04" PRIx32 "-%08" PRIx32 "%04" PRIx32,
              random1, 
              (random2 >> 16) & 0xFFFF,
              (random2 & 0xFFFF) | 0x4000,  // Version 4 UUID
@@ -55,14 +57,34 @@ bool DoubaoProtocol::ConnectToDoubao() {
     headers["X-Api-Resource-Id"] = RESOURCE_ID;
     headers["X-Api-App-Key"] = APP_KEY;
     
-    // Create WebSocket connection
-    websocket_ = std::make_unique<WebSocket>();
-    websocket_->SetDataCallback(OnWebSocketData, this);
-    websocket_->SetConnectedCallback(OnWebSocketConnected, this);
-    websocket_->SetDisconnectedCallback(OnWebSocketDisconnected, this);
-    websocket_->SetErrorCallback(OnWebSocketError, this);
+    // Create WebSocket connection through Board's network interface
+    auto network = Board::GetInstance().GetNetwork();
+    websocket_ = network->CreateWebSocket(1);
+    if (websocket_ == nullptr) {
+        ESP_LOGE(TAG, "Failed to create websocket");
+        return false;
+    }
+    websocket_->OnData([this](const char* data, size_t len, bool binary) {
+        OnWebSocketData(reinterpret_cast<const uint8_t*>(data), len, this);
+    });
+    websocket_->OnConnected([this]() {
+        OnWebSocketConnected(this);
+    });
+    websocket_->OnDisconnected([this]() {
+        OnWebSocketDisconnected(this);
+    });
+    websocket_->OnError([this](int error) {
+        char error_msg[32];
+        snprintf(error_msg, sizeof(error_msg), "Error code: %d", error);
+        OnWebSocketError(error_msg, this);
+    });
+
+    // Set headers
+    for (const auto& header : headers) {
+        websocket_->SetHeader(header.first.c_str(), header.second.c_str());
+    }
     
-    if (!websocket_->Connect(BASE_URL, headers)) {
+    if (!websocket_->Connect(BASE_URL)) {
         ESP_LOGE(TAG, "Failed to connect to Doubao");
         return false;
     }
@@ -304,20 +326,9 @@ std::vector<uint8_t> DoubaoProtocol::BuildMessage(uint8_t message_type, uint8_t 
         message.insert(message.end(), session_id.begin(), session_id.end());
     }
     
-    // Compress payload if needed
+    // Compress payload if needed (disabled - no zlib in ESP-IDF)
     std::vector<uint8_t> processed_payload;
-    if (compress && payload_len > 0) {
-        uLongf compressed_len = compressBound(payload_len);
-        processed_payload.resize(compressed_len);
-        if (compress2(processed_payload.data(), &compressed_len, payload, payload_len, Z_DEFAULT_COMPRESSION) == Z_OK) {
-            processed_payload.resize(compressed_len);
-        } else {
-            ESP_LOGE(TAG, "Failed to compress payload");
-            processed_payload.assign(payload, payload + payload_len);
-        }
-    } else {
-        processed_payload.assign(payload, payload + payload_len);
-    }
+    processed_payload.assign(payload, payload + payload_len);
     
     // Add payload size (4 bytes, big-endian)
     uint32_t payload_size_be = htonl(processed_payload.size());
@@ -342,6 +353,8 @@ void DoubaoProtocol::HandleWebSocketMessage(const uint8_t* data, size_t len) {
     uint8_t message_flags = data[1] & 0x0F;
     uint8_t serialization = (data[2] >> 4) & 0x0F;
     uint8_t compression = data[2] & 0x0F;
+    
+    (void)message_type; // Suppress unused variable warning
     
     if (protocol_version != PROTOCOL_VERSION || header_size != HEADER_SIZE) {
         ESP_LOGE(TAG, "Invalid protocol version or header size");
@@ -373,25 +386,17 @@ void DoubaoProtocol::HandleWebSocketMessage(const uint8_t* data, size_t len) {
     offset += 4;
     
     if (offset + payload_size > len) {
-        ESP_LOGE(TAG, "Invalid payload size: %d", payload_size);
+        ESP_LOGE(TAG, "Invalid payload size: %" PRIu32, payload_size);
         return;
     }
     
     // Extract payload
     const uint8_t* payload = data + offset;
     
-    // Decompress if needed
-    std::vector<uint8_t> decompressed;
+    // Decompress if needed (disabled - no zlib in ESP-IDF)
     if (compression == COMPRESSION_GZIP && payload_size > 0) {
-        uLongf decompressed_len = payload_size * 10;  // Estimate
-        decompressed.resize(decompressed_len);
-        if (uncompress(decompressed.data(), &decompressed_len, payload, payload_size) == Z_OK) {
-            payload = decompressed.data();
-            payload_size = decompressed_len;
-        } else {
-            ESP_LOGE(TAG, "Failed to decompress payload");
-            return;
-        }
+        ESP_LOGW(TAG, "Compressed payload received but zlib disabled");
+        return;
     }
     
     // Handle event
@@ -400,7 +405,7 @@ void DoubaoProtocol::HandleWebSocketMessage(const uint8_t* data, size_t len) {
 }
 
 void DoubaoProtocol::HandleDoubaoEvent(uint32_t event_id, const uint8_t* payload, size_t payload_len, bool is_json) {
-    ESP_LOGD(TAG, "Handling event %d, payload_len=%d, is_json=%d", event_id, payload_len, is_json);
+    ESP_LOGD(TAG, "Handling event %" PRIu32 ", payload_len=%d, is_json=%d", event_id, payload_len, is_json);
     
     switch (event_id) {
         case DOUBAO_EVENT_CONNECTION_STARTED:
@@ -473,7 +478,7 @@ void DoubaoProtocol::HandleDoubaoEvent(uint32_t event_id, const uint8_t* payload
             
         case DOUBAO_EVENT_SESSION_FAILED:
         case DOUBAO_EVENT_CONNECTION_FAILED:
-            ESP_LOGE(TAG, "Error event %d", event_id);
+            ESP_LOGE(TAG, "Error event %" PRIu32, event_id);
             if (is_json && payload_len > 0) {
                 cJSON* root = cJSON_ParseWithLength((const char*)payload, payload_len);
                 if (root) {
@@ -489,7 +494,7 @@ void DoubaoProtocol::HandleDoubaoEvent(uint32_t event_id, const uint8_t* payload
             break;
             
         default:
-            ESP_LOGD(TAG, "Unhandled event: %d", event_id);
+            ESP_LOGD(TAG, "Unhandled event: %" PRIu32, event_id);
             break;
     }
 }

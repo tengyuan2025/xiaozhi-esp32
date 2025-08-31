@@ -2,7 +2,7 @@
 #define DOUBAO_PROTOCOL_H
 
 #include "protocol.h"
-#include "../utils/websocket.h"
+#include <web_socket.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/event_groups.h>
 #include <memory>

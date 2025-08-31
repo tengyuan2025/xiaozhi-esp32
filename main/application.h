@@ -22,7 +22,6 @@
 #define MAIN_EVENT_WAKE_WORD_DETECTED (1 << 2)
 #define MAIN_EVENT_VAD_CHANGE (1 << 3)
 #define MAIN_EVENT_ERROR (1 << 4)
-#define MAIN_EVENT_CHECK_NEW_VERSION_DONE (1 << 5)
 
 enum AecMode {
     kAecOff,
@@ -82,11 +81,8 @@ private:
     bool has_server_time_ = false;
     bool aborted_ = false;
     int clock_ticks_ = 0;
-    TaskHandle_t check_new_version_task_handle_ = nullptr;
-
     void OnWakeWordDetected();
     void OnVadDetected();
-    void CheckNewVersion(Ota& ota);
     void ShowActivationCode(const std::string& code, const std::string& message);
     void OnClockTimer();
     void SetListeningMode(ListeningMode mode);

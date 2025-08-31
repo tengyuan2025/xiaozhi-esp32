@@ -76,114 +76,6 @@ Application::~Application() {
     vEventGroupDelete(event_group_);
 }
 
-void Application::CheckNewVersion(Ota& ota) {
-    const int MAX_RETRY = 10;
-    int retry_count = 0;
-    int retry_delay = 10; // 初始重试延迟为10秒
-
-    auto& board = Board::GetInstance();
-    while (true) {
-        SetDeviceState(kDeviceStateActivating);
-        auto display = board.GetDisplay();
-        display->SetStatus(Lang::Strings::CHECKING_NEW_VERSION);
-
-        if (!ota.CheckVersion()) {
-            retry_count++;
-            if (retry_count >= MAX_RETRY) {
-                ESP_LOGE(TAG, "Too many retries, exit version check");
-                return;
-            }
-
-            char buffer[256];
-            snprintf(buffer, sizeof(buffer), Lang::Strings::CHECK_NEW_VERSION_FAILED, retry_delay, ota.GetCheckVersionUrl().c_str());
-            Alert(Lang::Strings::ERROR, buffer, "sad", Lang::Sounds::OGG_EXCLAMATION);
-
-            ESP_LOGW(TAG, "Check new version failed, retry in %d seconds (%d/%d)", retry_delay, retry_count, MAX_RETRY);
-            for (int i = 0; i < retry_delay; i++) {
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                if (device_state_ == kDeviceStateIdle) {
-                    break;
-                }
-            }
-            retry_delay *= 2; // 每次重试后延迟时间翻倍
-            continue;
-        }
-        retry_count = 0;
-        retry_delay = 10; // 重置重试延迟时间
-
-        if (ota.HasNewVersion()) {
-            Alert(Lang::Strings::OTA_UPGRADE, Lang::Strings::UPGRADING, "happy", Lang::Sounds::OGG_UPGRADE);
-
-            vTaskDelay(pdMS_TO_TICKS(3000));
-
-            SetDeviceState(kDeviceStateUpgrading);
-            
-            display->SetIcon(FONT_AWESOME_DOWNLOAD);
-            std::string message = std::string(Lang::Strings::NEW_VERSION) + ota.GetFirmwareVersion();
-            display->SetChatMessage("system", message.c_str());
-
-            board.SetPowerSaveMode(false);
-            audio_service_.Stop();
-            vTaskDelay(pdMS_TO_TICKS(1000));
-
-            bool upgrade_success = ota.StartUpgrade([display](int progress, size_t speed) {
-                std::thread([display, progress, speed]() {
-                    char buffer[32];
-                    snprintf(buffer, sizeof(buffer), "%d%% %uKB/s", progress, speed / 1024);
-                    display->SetChatMessage("system", buffer);
-                }).detach();
-            });
-
-            if (!upgrade_success) {
-                // Upgrade failed, restart audio service and continue running
-                ESP_LOGE(TAG, "Firmware upgrade failed, restarting audio service and continuing operation...");
-                audio_service_.Start(); // Restart audio service
-                board.SetPowerSaveMode(true); // Restore power save mode
-                Alert(Lang::Strings::ERROR, Lang::Strings::UPGRADE_FAILED, "sad", Lang::Sounds::OGG_EXCLAMATION);
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                // Continue to normal operation (don't break, just fall through)
-            } else {
-                // Upgrade success, reboot immediately
-                ESP_LOGI(TAG, "Firmware upgrade successful, rebooting...");
-                display->SetChatMessage("system", "Upgrade successful, rebooting...");
-                vTaskDelay(pdMS_TO_TICKS(1000)); // Brief pause to show message
-                Reboot();
-                return; // This line will never be reached after reboot
-            }
-        }
-
-        // No new version, mark the current version as valid
-        ota.MarkCurrentVersionValid();
-        if (!ota.HasActivationCode() && !ota.HasActivationChallenge()) {
-            xEventGroupSetBits(event_group_, MAIN_EVENT_CHECK_NEW_VERSION_DONE);
-            // Exit the loop if done checking new version
-            break;
-        }
-
-        display->SetStatus(Lang::Strings::ACTIVATION);
-        // Activation code is shown to the user and waiting for the user to input
-        if (ota.HasActivationCode()) {
-            ShowActivationCode(ota.GetActivationCode(), ota.GetActivationMessage());
-        }
-
-        // This will block the loop until the activation is done or timeout
-        for (int i = 0; i < 10; ++i) {
-            ESP_LOGI(TAG, "Activating... %d/%d", i + 1, 10);
-            esp_err_t err = ota.Activate();
-            if (err == ESP_OK) {
-                xEventGroupSetBits(event_group_, MAIN_EVENT_CHECK_NEW_VERSION_DONE);
-                break;
-            } else if (err == ESP_ERR_TIMEOUT) {
-                vTaskDelay(pdMS_TO_TICKS(3000));
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(10000));
-            }
-            if (device_state_ == kDeviceStateIdle) {
-                break;
-            }
-        }
-    }
-}
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
     struct digit_sound {
@@ -374,9 +266,6 @@ void Application::Start() {
     // Update the status bar immediately to show the network state
     display->UpdateStatusBar(true);
 
-    // Check for new firmware version or get the MQTT broker address
-    Ota ota;
-    CheckNewVersion(ota);
 
     // Initialize the protocol
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
@@ -392,15 +281,9 @@ void Application::Start() {
     ESP_LOGI(TAG, "Using MQTT protocol");
     protocol_ = std::make_unique<MqttProtocol>();
 #else
-    // Default to WebSocket protocol, with fallback based on OTA config
-    if (ota.HasMqttConfig()) {
-        protocol_ = std::make_unique<MqttProtocol>();
-    } else if (ota.HasWebsocketConfig()) {
-        protocol_ = std::make_unique<WebsocketProtocol>();
-    } else {
-        ESP_LOGW(TAG, "No protocol specified in the OTA config, using WebSocket");
-        protocol_ = std::make_unique<WebsocketProtocol>();
-    }
+    // Default to WebSocket protocol
+    ESP_LOGI(TAG, "Using WebSocket protocol");
+    protocol_ = std::make_unique<WebsocketProtocol>();
 #endif
 
     protocol_->OnNetworkError([this](const std::string& message) {
@@ -520,10 +403,9 @@ void Application::Start() {
 
     SetDeviceState(kDeviceStateIdle);
 
-    has_server_time_ = ota.HasServerTime();
+    has_server_time_ = false;
     if (protocol_started) {
-        std::string message = std::string(Lang::Strings::VERSION) + ota.GetCurrentVersion();
-        display->ShowNotification(message.c_str());
+        display->ShowNotification(Lang::Strings::CONNECTION_SUCCESSFUL);
         display->SetChatMessage("system", "");
         // Play the success sound to indicate the device is ready
         audio_service_.PlaySound(Lang::Sounds::OGG_SUCCESS);
