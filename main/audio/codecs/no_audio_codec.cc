@@ -3,6 +3,7 @@
 #include <esp_log.h>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 #define TAG "NoAudioCodec"
 
@@ -136,12 +137,15 @@ NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sampl
     chan_cfg.id = (i2s_port_t)1;
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, nullptr, &rx_handle_));
     std_cfg.clk_cfg.sample_rate_hz = (uint32_t)input_sample_rate_;
+    // Use BOTH channels for better compatibility with different mic types
+    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;  // Try both channels
+    std_cfg.slot_cfg.slot_mode = I2S_SLOT_MODE_STEREO;  // Stereo mode to capture both
     std_cfg.gpio_cfg.bclk = mic_sck;
     std_cfg.gpio_cfg.ws = mic_ws;
     std_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
     std_cfg.gpio_cfg.din = mic_din;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle_, &std_cfg));
-    ESP_LOGI(TAG, "Simplex channels created");
+    ESP_LOGI(TAG, "Simplex channels created - using BOTH channels for mic");
 }
 
 NoAudioCodecSimplex::NoAudioCodecSimplex(int input_sample_rate, int output_sample_rate, gpio_num_t spk_bclk, gpio_num_t spk_ws, gpio_num_t spk_dout, i2s_std_slot_mask_t spk_slot_mask, gpio_num_t mic_sck, gpio_num_t mic_ws, gpio_num_t mic_din, i2s_std_slot_mask_t mic_slot_mask){
@@ -303,19 +307,33 @@ int NoAudioCodec::Write(const int16_t* data, int samples) {
 
 int NoAudioCodec::Read(int16_t* dest, int samples) {
     size_t bytes_read;
-
-    std::vector<int32_t> bit32_buffer(samples);
-    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
+    
+    // For stereo mode, we need double the buffer size
+    std::vector<int32_t> bit32_buffer(samples * 2);
+    if (i2s_channel_read(rx_handle_, bit32_buffer.data(), samples * 2 * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) {
         ESP_LOGE(TAG, "Read Failed!");
         return 0;
     }
 
-    samples = bytes_read / sizeof(int32_t);
-    for (int i = 0; i < samples; i++) {
-        int32_t value = bit32_buffer[i] >> 12;
+    int actual_samples = bytes_read / (2 * sizeof(int32_t));  // Divide by 2 for stereo
+    for (int i = 0; i < actual_samples; i++) {
+        // Try both left and right channels, use whichever has data
+        int32_t left = bit32_buffer[i * 2];      // Left channel
+        int32_t right = bit32_buffer[i * 2 + 1]; // Right channel
+        
+        // Use the channel with stronger signal (larger absolute value)
+        int32_t value = (abs(left) > abs(right)) ? left : right;
+        
+        // Common bit shifts for I2S MEMS mics: 8, 12, 14, or 16
+        // Try adaptive approach - if value is too small, reduce shift
+        int shift = 14;
+        if (abs(value) < 0x1000) shift = 8;  // If value is small, use less shift
+        else if (abs(value) > 0x10000000) shift = 16;  // If value is large, use more shift
+        
+        value = value >> shift;
         dest[i] = (value > INT16_MAX) ? INT16_MAX : (value < -INT16_MAX) ? -INT16_MAX : (int16_t)value;
     }
-    return samples;
+    return actual_samples;
 }
 
 int NoAudioCodecSimplexPdm::Read(int16_t* dest, int samples) {

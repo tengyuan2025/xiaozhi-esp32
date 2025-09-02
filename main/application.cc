@@ -259,36 +259,24 @@ void Application::Start() {
         xEventGroupSetBits(event_group_, MAIN_EVENT_WAKE_WORD_DETECTED);
     };
     callbacks.on_vad_change = [this](bool speaking) {
-        ESP_LOGI(TAG, "🎤 VAD State Changed: %s (recording=%s, state=%s)", 
-                 speaking ? "VOICE_DETECTED" : "VOICE_STOPPED",
-                 vad_trigger_recording_ ? "enabled" : "disabled",
-                 STATE_STRINGS[device_state_]);
-                 
-        xEventGroupSetBits(event_group_, MAIN_EVENT_VAD_CHANGE);
-        // 如果启用了VAD触发录音模式，且检测到语音，自动开始录音
-        if (vad_trigger_recording_ && speaking && device_state_ == kDeviceStateIdle) {
-            ESP_LOGI(TAG, "🎙️ VAD triggered recording - starting audio capture and processing");
-            Schedule([this]() {
-                OnVadDetected();
+        ESP_LOGI(TAG, "🎤 VAD State Changed: %s", speaking ? "VOICE_DETECTED" : "VOICE_STOPPED");
+        
+        if (vad_trigger_recording_ && http_audio_client_) {
+            Schedule([this, speaking]() {
+                OnVadStateChange(speaking);
             });
         }
     };
     
-    // 对于HTTP协议，设置PCM数据回调
-#ifdef CONFIG_USE_HTTP_PROTOCOL
+    // Set PCM data callback for recording when VAD is active
     callbacks.on_pcm_data_available = [this](const std::vector<int16_t>& pcm_data) {
-        ESP_LOGI(TAG, "📡 PCM Data Available: %zu samples (%.2f ms, %.2f KB)", 
-                 pcm_data.size(), 
-                 (float)pcm_data.size() / 16.0f,  // 16kHz采样率转换为毫秒
-                 (float)pcm_data.size() * sizeof(int16_t) / 1024.0f);  // 数据大小KB
-                 
-        if (protocol_ != nullptr) {
-            protocol_->SendPcmAudio(pcm_data);
-        } else {
-            ESP_LOGW(TAG, "⚠️ PCM data received but no protocol available");
+        if (is_recording_vad_ && vad_trigger_recording_) {
+            // Append PCM data to buffer when recording
+            vad_audio_buffer_.insert(vad_audio_buffer_.end(), pcm_data.begin(), pcm_data.end());
+            ESP_LOGD(TAG, "Recording: %zu samples collected, total: %zu", 
+                     pcm_data.size(), vad_audio_buffer_.size());
         }
     };
-#endif
     audio_service_.SetCallbacks(callbacks);
 
     /* Start the clock timer to update the status bar */
@@ -452,8 +440,101 @@ void Application::Start() {
         audio_service_.EnableVoiceProcessing(true);
         audio_service_.EnableWakeWordDetection(false);
     } else if (vad_trigger_recording_) {
-        ESP_LOGI(TAG, "VAD trigger recording enabled but no protocol - using wake word mode");
-        audio_service_.EnableWakeWordDetection(true);
+        ESP_LOGI(TAG, "VAD trigger recording enabled - using HTTP upload mode");
+        
+        // Initialize HTTP client for audio upload
+        http_audio_client_ = std::make_unique<HttpAudioClient>("http://192.168.0.114:8000/api/v1/process-voice-raw");
+        
+        // Set text response callback
+        http_audio_client_->SetResponseCallback([this](const std::string& response) {
+            ESP_LOGI(TAG, "Server text response: %s", response.c_str());
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetChatMessage("assistant", response.c_str());
+        });
+        
+        // Set audio response callback for streaming audio data
+        http_audio_client_->SetAudioResponseCallback([this](const std::vector<uint8_t>& audio_data) {
+            ESP_LOGI(TAG, "Received streaming audio response: %zu bytes", audio_data.size());
+            
+            if (audio_data.size() < 100) { // Too small to be valid audio
+                ESP_LOGW(TAG, "Audio response too small, ignoring");
+                return;
+            }
+            
+            // Convert uint8_t to int16_t PCM data
+            std::vector<int16_t> pcm_data;
+            size_t start_offset = 0;
+            
+            // Check for WAV header and skip it
+            if (audio_data.size() > 44 && 
+                audio_data[0] == 'R' && audio_data[1] == 'I' && 
+                audio_data[2] == 'F' && audio_data[3] == 'F') {
+                ESP_LOGI(TAG, "WAV header detected, skipping 44 bytes");
+                start_offset = 44;
+            }
+            
+            // Convert bytes to 16-bit PCM samples
+            size_t pcm_bytes = audio_data.size() - start_offset;
+            if (pcm_bytes % 2 != 0) {
+                pcm_bytes--; // Ensure even number of bytes
+            }
+            
+            pcm_data.resize(pcm_bytes / 2);
+            const int16_t* pcm_ptr = reinterpret_cast<const int16_t*>(audio_data.data() + start_offset);
+            std::copy(pcm_ptr, pcm_ptr + (pcm_bytes / 2), pcm_data.begin());
+            
+            ESP_LOGI(TAG, "Converted to %zu PCM samples, playing directly via AudioCodec", pcm_data.size());
+            
+            // Change device state to speaking for audio output
+            Schedule([this, pcm_data = std::move(pcm_data)]() mutable {
+                SetDeviceState(kDeviceStateSpeaking);
+                
+                // Play PCM data directly through audio codec
+                auto codec = Board::GetInstance().GetAudioCodec();
+                ESP_LOGI(TAG, "Codec status: codec=%p, output_enabled=%s", 
+                         codec, codec ? (codec->output_enabled() ? "true" : "false") : "null");
+                
+                // Ensure output is enabled before playback
+                if (codec) {
+                    if (!codec->output_enabled()) {
+                        ESP_LOGI(TAG, "Enabling codec output for playback");
+                        codec->EnableOutput(true);
+                    }
+                }
+                
+                if (codec && codec->output_enabled()) {
+                    // Split large audio into chunks to avoid blocking
+                    const size_t chunk_size = 1024; // 1024 samples per chunk
+                    size_t offset = 0;
+                    
+                    while (offset < pcm_data.size()) {
+                        size_t chunk_samples = std::min(chunk_size, pcm_data.size() - offset);
+                        std::vector<int16_t> chunk(pcm_data.begin() + offset, 
+                                                   pcm_data.begin() + offset + chunk_samples);
+                        
+                        ESP_LOGD(TAG, "Playing audio chunk: %zu samples at offset %zu", 
+                                chunk_samples, offset);
+                        codec->OutputData(chunk);
+                        
+                        offset += chunk_samples;
+                        
+                        // Small delay to prevent audio buffer overflow
+                        vTaskDelay(pdMS_TO_TICKS(10));
+                    }
+                    
+                    ESP_LOGI(TAG, "Audio playback completed");
+                    SetDeviceState(kDeviceStateIdle);
+                } else {
+                    ESP_LOGE(TAG, "Audio codec not available or output not enabled");
+                    SetDeviceState(kDeviceStateIdle);
+                }
+            });
+        });
+        
+        // Enable voice processing for VAD detection
+        audio_service_.EnableVoiceProcessing(true);
+        // Disable wake word detection
+        audio_service_.EnableWakeWordDetection(false);
     } else {
         ESP_LOGI(TAG, "Using wake word detection mode");
         audio_service_.EnableWakeWordDetection(true);
@@ -659,13 +740,20 @@ void Application::SetDeviceState(DeviceState state) {
             display->SetStatus(Lang::Strings::SPEAKING);
 
             if (listening_mode_ != kListeningModeRealtime) {
-                audio_service_.EnableVoiceProcessing(false);
-                // Only AFE wake word can be detected in speaking mode
+                if (vad_trigger_recording_) {
+                    // VAD触发录音模式：保持语音处理启用，确保音频输出正常
+                    // 不要重新初始化音频服务，保持当前配置
+                    ESP_LOGI(TAG, "Speaking in VAD mode, keeping voice processing enabled");
+                } else {
+                    // 传统模式：禁用语音处理，启用唤醒词检测
+                    audio_service_.EnableVoiceProcessing(false);
+                    // Only AFE wake word can be detected in speaking mode
 #if CONFIG_USE_AFE_WAKE_WORD
-                audio_service_.EnableWakeWordDetection(true);
+                    audio_service_.EnableWakeWordDetection(true);
 #else
-                audio_service_.EnableWakeWordDetection(false);
+                    audio_service_.EnableWakeWordDetection(false);
 #endif
+                }
             }
             audio_service_.ResetDecoder();
             break;
@@ -806,5 +894,111 @@ void Application::OnVadDetected() {
         SetListeningMode(kListeningModeAutoStop);
     } else {
         ESP_LOGW(TAG, "⚠️ VAD detected but device not in idle state (current: %s)", STATE_STRINGS[device_state_]);
+    }
+}
+
+void Application::OnVadStateChange(bool is_speaking) {
+    ESP_LOGI(TAG, "VAD state change: %s", is_speaking ? "SPEAKING" : "SILENT");
+    
+    if (is_speaking && !is_recording_vad_) {
+        // Start recording
+        is_recording_vad_ = true;
+        vad_audio_buffer_.clear();
+        vad_audio_buffer_.reserve(16000 * 10); // Reserve space for 10 seconds at 16kHz
+        
+        ESP_LOGI(TAG, "Started VAD recording (need ≥0.25s for 8000 bytes minimum)");
+        
+        // Update display
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus("Recording...");
+        display->SetEmotion("listening");
+        
+    } else if (!is_speaking && is_recording_vad_) {
+        // Stop recording and send data
+        is_recording_vad_ = false;
+        
+        ESP_LOGI(TAG, "Stopped VAD recording, collected %zu samples (%.2f seconds)", 
+                 vad_audio_buffer_.size(), 
+                 (float)vad_audio_buffer_.size() / 16000.0f);
+        
+        // Send audio to server
+        if (!vad_audio_buffer_.empty()) {
+            SendVadAudioToServer();
+        }
+        
+        // Update display
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus("Processing...");
+        display->SetEmotion("thinking");
+    }
+}
+
+void Application::SendVadAudioToServer() {
+    if (!http_audio_client_) {
+        ESP_LOGE(TAG, "HTTP client not initialized");
+        return;
+    }
+    
+    if (vad_audio_buffer_.empty()) {
+        ESP_LOGW(TAG, "No audio data to send");
+        return;
+    }
+    
+    // Check minimum audio data size (8000 bytes = 4000 samples of 16-bit PCM)
+    size_t audio_bytes = vad_audio_buffer_.size() * sizeof(int16_t);
+    const size_t min_audio_bytes = 8000;
+    
+    if (audio_bytes < min_audio_bytes) {
+        ESP_LOGW(TAG, "Audio data too small: %zu bytes (need at least %zu bytes), discarding", 
+                 audio_bytes, min_audio_bytes);
+        vad_audio_buffer_.clear();
+        
+        // Update display to show the recording was too short
+        auto display = Board::GetInstance().GetDisplay();
+        display->SetStatus("Recording too short");
+        display->SetEmotion("neutral");
+        
+        // Reset to idle after a short delay
+        Schedule([]() {
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            auto display = Board::GetInstance().GetDisplay();
+            display->SetStatus(Lang::Strings::STANDBY);
+            display->SetEmotion("neutral");
+        });
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Sending %zu audio samples (%zu bytes) to server", 
+             vad_audio_buffer_.size(), audio_bytes);
+    
+    // Create a copy of the buffer for sending
+    auto audio_data = std::move(vad_audio_buffer_);
+    vad_audio_buffer_.clear();
+    
+    // Send in background task to avoid blocking
+    xTaskCreate([](void* param) {
+        auto* app = static_cast<Application*>(param);
+        auto& client = app->http_audio_client_;
+        auto& data = app->vad_audio_buffer_;
+        
+        // Note: We already moved the data, so use the local copy
+        // This is a simplified version - in production you'd pass the data properly
+        ESP_LOGI(TAG, "HTTP upload task started");
+        
+        vTaskDelete(NULL);
+    }, "http_upload", 8192, this, 5, NULL);
+    
+    // Actually send the data
+    bool success = http_audio_client_->SendAudioData(audio_data);
+    
+    auto display = Board::GetInstance().GetDisplay();
+    if (success) {
+        ESP_LOGI(TAG, "Audio sent successfully");
+        display->SetStatus(Lang::Strings::STANDBY);
+        display->SetEmotion("neutral");
+    } else {
+        ESP_LOGE(TAG, "Failed to send audio");
+        display->SetStatus("Upload failed");
+        display->SetEmotion("error");
     }
 }

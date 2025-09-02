@@ -16,6 +16,7 @@
 #include "ota.h"
 #include "audio_service.h"
 #include "device_state_event.h"
+#include "http_audio_client.h"
 
 #define MAIN_EVENT_SCHEDULE (1 << 0)
 #define MAIN_EVENT_SEND_AUDIO (1 << 1)
@@ -86,6 +87,13 @@ private:
     void ShowActivationCode(const std::string& code, const std::string& message);
     void OnClockTimer();
     void SetListeningMode(ListeningMode mode);
+    
+    // HTTP audio upload
+    std::unique_ptr<HttpAudioClient> http_audio_client_;
+    std::vector<int16_t> vad_audio_buffer_;
+    bool is_recording_vad_ = false;
+    void OnVadStateChange(bool is_speaking);
+    void SendVadAudioToServer();
 };
 
 #endif // _APPLICATION_H_

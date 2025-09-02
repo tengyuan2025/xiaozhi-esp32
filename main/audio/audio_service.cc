@@ -199,7 +199,7 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
             return false;
         }
         
-        // Debug microphone input levels
+        // Debug microphone input levels (only for significant audio signals)
         static int debug_counter = 0;
         if (debug_counter++ % 50 == 0) { // Log every 50 reads to avoid spam
             int32_t max_level = 0;
@@ -209,10 +209,15 @@ bool AudioService::ReadAudioData(std::vector<int16_t>& data, int sample_rate, in
                     max_level = abs_val;
                 }
             }
-            ESP_LOGI(TAG, "🎤 Mic: %zu samples, max: %" PRId32 " (%.1f%%)", 
-                     data.size(), max_level, (float)max_level * 100.0f / 32767.0f);
-            ESP_LOGI(TAG, "🎚️ Audio: %d->%d Hz, %d channels", 
-                     codec_->input_sample_rate(), sample_rate, codec_->input_channels());
+            
+            // Only log if audio level is above noise floor (>2% of max range)
+            float level_percent = (float)max_level * 100.0f / 32767.0f;
+            if (level_percent > 2.0f) {
+                ESP_LOGI(TAG, "🎤 Mic: %zu samples, max: %" PRId32 " (%.1f%%)", 
+                         data.size(), max_level, level_percent);
+                ESP_LOGI(TAG, "🎚️ Audio: %d->%d Hz, %d channels", 
+                         codec_->input_sample_rate(), sample_rate, codec_->input_channels());
+            }
         }
     }
 

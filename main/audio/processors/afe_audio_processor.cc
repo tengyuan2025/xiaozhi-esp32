@@ -39,9 +39,9 @@ void AfeAudioProcessor::Initialize(AudioCodec* codec, int frame_duration_ms) {
     
     afe_config_t* afe_config = afe_config_init(input_format.c_str(), NULL, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
-    // Try more sensitive VAD mode for debugging
-    afe_config->vad_mode = VAD_MODE_0;  // 0=normal, 1=loose, 2=strict
-    afe_config->vad_min_noise_ms = 50;  // Reduced from 100ms to make more sensitive
+    // Use stricter VAD mode to reduce false positives from keyboard/environmental sounds
+    afe_config->vad_mode = VAD_MODE_2;  // 0=normal, 1=loose, 2=strict (more selective)
+    afe_config->vad_min_noise_ms = 100; // Increased to 100ms to filter out brief sounds like keyboard clicks
     
     ESP_LOGI(TAG, "  🔊 VAD mode: %d", afe_config->vad_mode);
     ESP_LOGI(TAG, "  🔇 VAD min noise ms: %d", afe_config->vad_min_noise_ms);
@@ -168,9 +168,6 @@ void AfeAudioProcessor::AudioProcessorTask() {
 
         // VAD state change with detailed logging
         if (vad_state_change_callback_) {
-            ESP_LOGI(TAG, "🎙️ Raw VAD state: %d, current is_speaking_: %s", 
-                     res->vad_state, is_speaking_ ? "true" : "false");
-            
             if (res->vad_state == VAD_SPEECH && !is_speaking_) {
                 is_speaking_ = true;
                 ESP_LOGI(TAG, "🔊 VAD SPEECH DETECTED! Triggering callback (silence->speech)");

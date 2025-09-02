@@ -25,7 +25,7 @@ bool HttpProtocol::Start() {
 
 bool HttpProtocol::OpenAudioChannel() {
     Settings settings("http", false);
-    server_url_ = settings.GetString("url", "http://192.168.1.105:8000/api/v1/process-voice-json");
+    server_url_ = settings.GetString("url", "http://192.168.0.114:8000/api/v1/process-voice-raw");
     
     ESP_LOGI(TAG, "Setting up HTTP audio channel to: %s", server_url_.c_str());
     
